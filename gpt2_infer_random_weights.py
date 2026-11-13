@@ -87,7 +87,7 @@ class MultiHeadAttention:
         self.W_proj = rng.normal(0, s, (d_model, d_model))
         self.b_proj = np.zeros(d_model)
 
-    def __call__(self, x, mask): # x: (T, 64), mask: (T, T)
+    def __call__(self, x, mask, cache=None): # x: (T, 64), mask: (T, T)
         T = x.shape[0]
 
         # make Q, K, V
@@ -95,6 +95,12 @@ class MultiHeadAttention:
         qkv = qkv.reshape(T, 3, self.h, self.d_k) # (T, 192) -> (T, 3, 4, 16)
         qkv = qkv.transpose(1, 2, 0, 3) # (T, 3, 4, 16) -> (3, 4, T, 16)
         Q, K, V = qkv[0], qkv[1], qkv[2] # (4, T, 16)
+
+        if cache is not None:
+            if "K" in cache:
+                K = np.concatenate([cache["K"], K], axis=1)
+                V = np.concatenate([cache["V"], V], axis=1)
+            cache["K"], cache["V"] = K, V
 
         # scaled dot product attention
         # multiplies Q and K then apply causal mask
@@ -140,14 +146,14 @@ class TransformerBlock:
         self.ln_2 = LayerNorm()
         self.ffn = FeedForwardNetwork()
 
-    def __call__(self, x, mask):
+    def __call__(self, x, mask, cache=None):
         # Each transformer block just does 4 things
         # * apply first layer norm
         # * do residual connection x with multi_head_attention(x, causal_mask)
         # * apply second layer norm
         # * do residual connection x with feed_forward_network(x)
         # In the GPT-2 there are several transformer blocks but it's done in GPT2 class __call__ method.
-        x = x + self.mha(self.ln_1(x), mask) # (T, 64) -> (T, 64)
+        x = x + self.mha(self.ln_1(x), mask, cache) # (T, 64) -> (T, 64)
         x = x + self.ffn(self.ln_2(x))       # (T, 64) -> (T, 64)
         return x
 
@@ -160,18 +166,19 @@ class GPT2:
         self.blocks = [TransformerBlock() for _ in range(n_layers)]
         self.ln_f = LayerNorm()
 
-    def __call__(self, tokens):
+    def __call__(self, tokens, cache=None, start_pos=0):
         T = len(tokens)  # input tokens size
 
         # apply token embedding and positional encoding
         # multiplies sqrt(d_model) as the original paper
-        x = self.wte[tokens] * np.sqrt(d_model) + self.wpe[:T] # (T, 64)
+        x = self.wte[tokens] * np.sqrt(d_model) + self.wpe[start_pos:start_pos+T] # (T, 64)
 
         # make causal mask: the upper right gets True (= masked) to prevent leak
-        causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+        causal_mask = np.triu(np.ones((T, start_pos+T), dtype=bool), k=start_pos+1)
 
         # apply transformers
-        for block in self.blocks: x = block(x, causal_mask) # (T, 64) -> (T, 64)
+        for i, block in enumerate(self.blocks):
+            x = block(x, causal_mask, None if cache is None else cache[i]) # (T, 64) -> (T, 64)
 
         # final layer norm
         x = self.ln_f(x) # (T, 64) -> (T, 64)
@@ -179,18 +186,26 @@ class GPT2:
         # This is the final result logit
         return x @ self.wte.T # (T, 64) @ (64, vocab_size) -> (T, vocab_size)
 
-# self recursive generation
 def generate(model, tokens, n_new, temperature=0.0):
+    cache = [dict() for _ in model.blocks]
     tokens = list(tokens)
-    for _ in range(n_new):
-        context = np.array(tokens[-input_tokens_limit:]) # cut input not to exceed limit
-        logits = model(context)[-1]  # the last token logits
+
+    # prefill
+    logits = model(np.array(tokens), cache, start_pos=0)[-1]
+
+    # decode
+    for i in range(n_new):
         if temperature == 0.0:
             next_token = int(np.argmax(logits))
         else:
             probs = softmax(logits/temperature)
             next_token = int(rng.choice(len(probs), p=probs))
         tokens.append(next_token)
+
+        if i == n_new - 1: break
+
+        # decode
+        logits = model(np.array([next_token]), cache, start_pos=len(tokens)-1)[-1]
     return tokens
 
 corpus = 'Generative Pre-trained Transformer 2 (GPT-2) is a large language model (LLM) by OpenAI and the second in their foundational series of GPT models. GPT-2 was pre-trained on a dataset of 8 million web pages. It was partially released in February 2019, followed by full release of the 1.5-billion-parameter model on November 5, 2019. GPT-2 was created as a "direct scale-up" of GPT-1 with a ten-fold increase in both its parameter count and the size of its training dataset. It is a general-purpose learner and its ability to perform the various tasks was a consequence of its general ability to accurately predict the next item in a sequence, which enabled it to translate texts, answer questions about a topic from a text, summarize passages from a larger text, and generate text output on a level sometimes indistinguishable from that of humans; however, it could become repetitive or nonsensical when generating long passages. It was superseded by the GPT-3 and GPT-4 models, which are no longer open source. GPT-2 has, like its predecessor GPT-1 and its successors GPT-3, GPT-4 and GPT-5, a generative pre-trained transformer architecture, implementing a deep neural network, specifically a transformer model, which uses attention instead of older recurrence- and convolution-based architectures. Attention mechanisms allow the model to selectively focus on segments of input text it predicts to be the most relevant. This model allows for greatly increased parallelization, and outperforms previous benchmarks for RNN/CNN/LSTM-based models.'
@@ -199,4 +214,4 @@ tok = CharTokenizer(corpus)
 print(f"{tok.vocab_size=}")
 model = GPT2(tok.vocab_size)
 
-print(tok.decode(generate(model, tok.encode("hello "), 20, 1.0)))
+print(tok.decode(generate(model, tok.encode("hello "), 100, 1.0)))
